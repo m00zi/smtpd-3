@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"io"
 	"io/ioutil"
 	"log"
@@ -11,66 +12,58 @@ import (
 	"net/textproto"
 	"os"
 	"strings"
-	"sync"
 )
 
 func main() {
-	ln, err := net.Listen("tcp", ":8080")
+	ln, err := net.Listen("tcp", ":2525")
 	if err != nil {
 		log.Fatal(err)
 	}
-	log.Print("Listening on port 8080")
+	log.Print("Listening on port 2525")
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
 			log.Fatal(err)
 		}
-		go handleConnection(conn)
+		go handle(conn)
 	}
 }
 
-var conns struct {
-	sync.Mutex
-	i int
-}
-
-type smtpTx struct {
+type smtpSession struct {
 	mailFrom string
 	rcptTo   []string
 	data     []string
 }
 
-func handleConnection(conn net.Conn) {
-	conns.Lock()
-	conns.i++
-	id := conns.i
-	conns.Unlock()
-
-	log.Printf("Handling %v", id)
+func handle(conn net.Conn) {
 	defer conn.Close()
-	defer log.Printf("Closing %v", id)
+	log.Printf("Handling %+v", conn.RemoteAddr())
+	defer log.Printf("Closing %+v", conn.RemoteAddr())
 
-	r := textproto.NewReader(bufio.NewReader(conn))
-	w := textproto.NewWriter(bufio.NewWriter(conn))
+	buf := &bytes.Buffer{}
+	r := textproto.NewReader(bufio.NewReader(io.TeeReader(conn, buf)))
+	w := textproto.NewWriter(bufio.NewWriter(io.MultiWriter(conn, buf)))
+	defer io.Copy(os.Stdout, buf)
 
+	session, err := smtpHandle(w, r)
+	if err != nil {
+		log.Print(err)
+		return
+	}
+	go sendMail(session)
+}
+
+func smtpHandle(w *textproto.Writer, r *textproto.Reader) (*smtpSession, error) {
+	s := &smtpSession{}
 	if err := w.PrintfLine("220 foo"); err != nil {
-		log.Fatal(err)
+		return s, err
 	}
 
-	var s smtpTx
-	// 2016/03/03 21:38:47 EHLO localhost
-	// 2016/03/03 21:38:47 MAIL FROM:<sender@example.org>
-	// 2016/03/03 21:38:47 RCPT TO:<recipient@example.net>
-	// 2016/03/03 21:38:47 DATA
-	// 2016/03/03 21:38:47 [To: recipient@example.net Subject: discount Gophers!  This is the email body.]
-	// 2016/03/03 21:38:47 QUIT
 	for {
 		line, err := r.ReadLine()
 		if err != nil {
-			log.Print(line, err)
-			return
+			return s, err
 		}
-		log.Print(line)
 		switch split := strings.Split(line, ":"); split[0] {
 		case "MAIL FROM":
 			s.mailFrom = split[1]
@@ -78,27 +71,20 @@ func handleConnection(conn net.Conn) {
 			s.rcptTo = append(s.rcptTo, split[1])
 		case "DATA":
 			if err := w.PrintfLine("354 foo"); err != nil {
-				log.Print(err)
-				return
+				return s, err
 			}
 			lines, err := r.ReadDotLines()
 			if err != nil {
-				log.Print(err)
-				return
+				return s, err
 			}
-			log.Printf("%#v", lines)
 			s.data = lines
 		case "QUIT":
-			if err := w.PrintfLine("221 foo"); err != nil {
-				log.Print(err)
-			}
-			go sendMail(s)
-			return
+			err := w.PrintfLine("221 foo")
+			return s, err
 		}
 
 		if err := w.PrintfLine("250 foo"); err != nil {
-			log.Print(err)
-			return
+			return s, err
 		}
 	}
 }
@@ -108,43 +94,78 @@ var (
 	smtpPassword = os.Getenv("SMTP_PASSWORD")
 	smtpServer   = os.Getenv("SMTP_SERVER")
 	smtpPort     = os.Getenv("SMTP_PORT")
+
+	fakeRcptDomain = os.Getenv("FAKE_RCPT_DOMAIN")
+	trueRcptLocal  = os.Getenv("TRUE_RCPT_LOCAL")
+	trueRcptDomain = os.Getenv("TRUE_RCPT_DOMAIN")
 )
 
-func sendMail(s smtpTx) {
+func init() {
+	if smtpUsername == "" {
+		log.Print("SMTP_USERNAME not set")
+	}
+	if smtpPassword == "" {
+		log.Print("SMTP_PASSWORD not set")
+	}
+	if smtpServer == "" {
+		log.Print("SMTP_SERVER not set")
+	}
+	if smtpPort == "" {
+		log.Print("SMTP_PORT not set")
+	}
+	if fakeRcptDomain == "" {
+		log.Print("FAKE_RCPT_DOMAIN not set")
+	}
+	if trueRcptLocal == "" {
+		log.Print("TRUE_RCPT_LOCAL not set")
+	}
+	if trueRcptDomain == "" {
+		log.Print("TRUE_RCPT_DOMAIN not set")
+	}
+}
+
+func sendMail(s *smtpSession) {
 	auth := smtp.PlainAuth("", smtpUsername, smtpPassword, smtpServer)
 	from := s.mailFrom
 
-	to := []string{"yannsalaun1@gmail.com"}
-
-	var plus string
-	for _, v := range s.rcptTo {
-		v = strings.Trim(v, "<>")
-		if strings.HasSuffix(v, "@yannsalaun.com") {
-			plus = v[:strings.Index(v, "@")]
-			break
-		}
-	}
-
-	var hdrs string
 	msg, err := mail.ReadMessage(strings.NewReader(strings.Join(s.data, "\r\n")))
 	if err != nil {
 		log.Print(err)
 	}
-	for k, v := range msg.Header {
+
+	// Remove headers that block sending
+	for k := range msg.Header {
 		if strings.HasPrefix(k, "X-") || k == "Dkim-Signature" ||
 			k == "Message-Id" || k == "Received" {
-			continue
+			delete(msg.Header, k)
 		}
-		if k == "To" {
-			v[0] = "yannsalaun1+" + plus + "@gmail.com"
-		}
-		hdrs += k + ": " + v[0] + "\r\n"
 	}
 
+	// Compute recipient address
+	var rcptAddr string
+	for _, v := range s.rcptTo {
+		v = strings.Trim(v, "<>")
+		if strings.HasSuffix(v, "@"+fakeRcptDomain) {
+			fakeRcptLocal := v[:strings.Index(v, "@")]
+			rcptAddr = trueRcptLocal + "+" + fakeRcptLocal + "@" + trueRcptDomain
+			break
+		}
+	}
+
+	// Redirect message
+	to := []string{rcptAddr}
+	msg.Header["To"] = []string{rcptAddr}
+
+	// Print message for sending
+	var hdrs string
+	for k, v := range msg.Header {
+		hdrs += k + ": " + v[0] + "\r\n"
+	}
 	bytes, err := ioutil.ReadAll(io.MultiReader(strings.NewReader(hdrs), msg.Body))
 	if err != nil {
 		log.Print(err)
 	}
+
 	if err := smtp.SendMail(smtpServer+":"+smtpPort, auth, from, to, bytes); err != nil {
 		log.Print(err)
 	} else {
