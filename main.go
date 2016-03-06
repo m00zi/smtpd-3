@@ -145,9 +145,8 @@ func sendMail(s *smtpSession) error {
 		if err != nil {
 			return err
 		}
-		addr := strings.Trim(parsed.Address, "<>")
-		if strings.HasSuffix(addr, "@"+fakeRcptDomain) {
-			fakeRcptLocal := addr[:strings.Index(addr, "@")]
+		if strings.HasSuffix(parsed.Address, "@"+fakeRcptDomain) {
+			fakeRcptLocal := parsed.Address[:strings.Index(parsed.Address, "@")]
 			rcptAddr = trueRcptLocal + "+" + fakeRcptLocal + "@" + trueRcptDomain
 			break
 		}
