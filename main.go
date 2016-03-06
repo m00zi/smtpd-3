@@ -14,81 +14,6 @@ import (
 	"strings"
 )
 
-func main() {
-	ln, err := net.Listen("tcp", ":2525")
-	if err != nil {
-		log.Fatal(err)
-	}
-	log.Print("Listening on port 2525")
-	for {
-		conn, err := ln.Accept()
-		if err != nil {
-			log.Fatal(err)
-		}
-		go handle(conn)
-	}
-}
-
-type smtpSession struct {
-	mailFrom string
-	rcptTo   []string
-	data     []string
-}
-
-func handle(conn net.Conn) {
-	defer conn.Close()
-	log.Printf("Handling %+v", conn.RemoteAddr())
-	defer log.Printf("Closing %+v", conn.RemoteAddr())
-
-	buf := &bytes.Buffer{}
-	r := textproto.NewReader(bufio.NewReader(io.TeeReader(conn, buf)))
-	w := textproto.NewWriter(bufio.NewWriter(io.MultiWriter(conn, buf)))
-	defer io.Copy(os.Stdout, buf)
-
-	session, err := smtpHandle(w, r)
-	if err != nil {
-		log.Print(err)
-		return
-	}
-	go sendMail(session)
-}
-
-func smtpHandle(w *textproto.Writer, r *textproto.Reader) (*smtpSession, error) {
-	s := &smtpSession{}
-	if err := w.PrintfLine("220 foo"); err != nil {
-		return s, err
-	}
-
-	for {
-		line, err := r.ReadLine()
-		if err != nil {
-			return s, err
-		}
-		switch split := strings.Split(line, ":"); split[0] {
-		case "MAIL FROM":
-			s.mailFrom = split[1]
-		case "RCPT TO":
-			s.rcptTo = append(s.rcptTo, split[1])
-		case "DATA":
-			if err := w.PrintfLine("354 foo"); err != nil {
-				return s, err
-			}
-			lines, err := r.ReadDotLines()
-			if err != nil {
-				return s, err
-			}
-			s.data = lines
-		case "QUIT":
-			err := w.PrintfLine("221 foo")
-			return s, err
-		}
-
-		if err := w.PrintfLine("250 foo"); err != nil {
-			return s, err
-		}
-	}
-}
-
 var (
 	smtpUsername = os.Getenv("SMTP_USERNAME")
 	smtpPassword = os.Getenv("SMTP_PASSWORD")
@@ -124,13 +49,95 @@ func init() {
 	}
 }
 
-func sendMail(s *smtpSession) {
+func main() {
+	ln, err := net.Listen("tcp", ":2525")
+	if err != nil {
+		log.Fatal(err)
+	}
+	log.Print("Listening on port 2525")
+	for {
+		conn, err := ln.Accept()
+		if err != nil {
+			log.Fatal(err)
+		}
+		go handle(conn)
+	}
+}
+
+type smtpSession struct {
+	mailFrom string
+	rcptTo   []string
+	data     []string
+}
+
+func handle(conn net.Conn) {
+	session, err := smtpHandle(conn)
+	if err != nil {
+		log.Print(err)
+		return
+	}
+	if len(session.data) == 0 {
+		return
+	}
+	if err := sendMail(session); err != nil {
+		log.Print(err)
+	} else {
+		log.Print("mail sent")
+	}
+}
+
+func smtpHandle(conn net.Conn) (*smtpSession, error) {
+	defer conn.Close()
+	log.Printf("Handling %+v", conn.RemoteAddr())
+	defer log.Printf("Closing %+v", conn.RemoteAddr())
+
+	buf := &bytes.Buffer{}
+	r := textproto.NewReader(bufio.NewReader(io.TeeReader(conn, buf)))
+	w := textproto.NewWriter(bufio.NewWriter(io.MultiWriter(conn, buf)))
+	defer io.Copy(os.Stdout, buf)
+
+	s := &smtpSession{}
+	if err := w.PrintfLine("220 foo"); err != nil {
+		return s, err
+	}
+
+	for {
+		line, err := r.ReadLine()
+		if err != nil {
+			return s, err
+		}
+		switch split := strings.Split(line, ":"); split[0] {
+		case "MAIL FROM":
+			s.mailFrom = split[1]
+		case "RCPT TO":
+			s.rcptTo = append(s.rcptTo, split[1])
+		case "DATA":
+			if err := w.PrintfLine("354 foo"); err != nil {
+				return s, err
+			}
+			lines, err := r.ReadDotLines()
+			if err != nil {
+				return s, err
+			}
+			s.data = lines
+		case "QUIT":
+			err := w.PrintfLine("221 foo")
+			return s, err
+		}
+
+		if err := w.PrintfLine("250 foo"); err != nil {
+			return s, err
+		}
+	}
+}
+
+func sendMail(s *smtpSession) error {
 	auth := smtp.PlainAuth("", smtpUsername, smtpPassword, smtpServer)
 	from := s.mailFrom
 
 	msg, err := mail.ReadMessage(strings.NewReader(strings.Join(s.data, "\r\n")))
 	if err != nil {
-		log.Print(err)
+		return err
 	}
 
 	// Remove headers that block sending
@@ -163,12 +170,8 @@ func sendMail(s *smtpSession) {
 	}
 	bytes, err := ioutil.ReadAll(io.MultiReader(strings.NewReader(hdrs), msg.Body))
 	if err != nil {
-		log.Print(err)
+		return err
 	}
 
-	if err := smtp.SendMail(smtpServer+":"+smtpPort, auth, from, to, bytes); err != nil {
-		log.Print(err)
-	} else {
-		log.Print("mail sent")
-	}
+	return smtp.SendMail(smtpServer+":"+smtpPort, auth, from, to, bytes)
 }
