@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"bytes"
 	"io"
-	"io/ioutil"
 	"log"
 	"net"
 	"net/mail"
@@ -72,7 +71,7 @@ type smtpSession struct {
 
 func handle(conn net.Conn) {
 	session, err := smtpHandle(conn)
-	if err != nil {
+	if err != nil && err != io.EOF {
 		log.Print(err)
 		return
 	}
@@ -133,27 +132,22 @@ func smtpHandle(conn net.Conn) (*smtpSession, error) {
 
 func sendMail(s *smtpSession) error {
 	auth := smtp.PlainAuth("", smtpUsername, smtpPassword, smtpServer)
-	from := s.mailFrom
-
-	msg, err := mail.ReadMessage(strings.NewReader(strings.Join(s.data, "\r\n")))
+	parsed, err := mail.ParseAddress(s.mailFrom)
 	if err != nil {
 		return err
 	}
-
-	// Remove headers that block sending
-	for k := range msg.Header {
-		if strings.HasPrefix(k, "X-") || k == "Dkim-Signature" ||
-			k == "Message-Id" || k == "Received" {
-			delete(msg.Header, k)
-		}
-	}
+	from := parsed.Address
 
 	// Compute recipient address
 	var rcptAddr string
 	for _, v := range s.rcptTo {
-		v = strings.Trim(v, "<>")
-		if strings.HasSuffix(v, "@"+fakeRcptDomain) {
-			fakeRcptLocal := v[:strings.Index(v, "@")]
+		parsed, err := mail.ParseAddress(v)
+		if err != nil {
+			return err
+		}
+		addr := strings.Trim(parsed.Address, "<>")
+		if strings.HasSuffix(addr, "@"+fakeRcptDomain) {
+			fakeRcptLocal := addr[:strings.Index(addr, "@")]
 			rcptAddr = trueRcptLocal + "+" + fakeRcptLocal + "@" + trueRcptDomain
 			break
 		}
@@ -161,17 +155,6 @@ func sendMail(s *smtpSession) error {
 
 	// Redirect message
 	to := []string{rcptAddr}
-	msg.Header["To"] = []string{rcptAddr}
 
-	// Print message for sending
-	var hdrs string
-	for k, v := range msg.Header {
-		hdrs += k + ": " + v[0] + "\r\n"
-	}
-	bytes, err := ioutil.ReadAll(io.MultiReader(strings.NewReader(hdrs), msg.Body))
-	if err != nil {
-		return err
-	}
-
-	return smtp.SendMail(smtpServer+":"+smtpPort, auth, from, to, bytes)
+	return smtp.SendMail(smtpServer+":"+smtpPort, auth, from, to, []byte(strings.Join(s.data, "\r\n")))
 }
